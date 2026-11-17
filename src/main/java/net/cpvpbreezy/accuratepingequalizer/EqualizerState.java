@@ -503,6 +503,13 @@ public final class EqualizerState {
             pacing = String.format(" | Timing error: %.1fms", h.getRecentTimingErrorMs());
         }
         String combat = isInCombat(System.nanoTime()) ? " | Combat lock" : "";
+        if (OptimizerPause.isPaused()) {
+            combat += " | Optimizers paused";
+        }
+        double input = InputDelay.currentMs();
+        if (input > 0) {
+            combat += String.format(" | Input delay %.0fms", input);
+        }
         return String.format("Accurate Ping Equalizer: %s | Base: %.0fms (±%.0f) | Added: %.0fms | Total: %.0fms%s%s",
                 modeStr, baseMs, jitterMs, appliedDelayMs, baseMs + appliedDelayMs, pacing, combat);
     }

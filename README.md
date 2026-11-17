@@ -29,11 +29,44 @@ low pings people actually play at, and in fast combos (crystals, anchors, sword 
 | `/ape total <ms>` | Make your **total** ping exactly `<ms>` (it measures your real ping and adds the difference). |
 | `/ape add <ms>` | Add a fixed `<ms>` on top of your real ping. |
 | `/ape match <player>` | Make your total ping the same as another player's (from the tab list), and keep following it if theirs changes. |
-| `/ape status` | Real (base) ping, added delay, total, live timing error, combat lock. |
+| `/ape status` | Real (base) ping, added delay, total, live timing error, combat lock, input delay, optimizer pause. |
 | `/ape off` | Turn it off. |
 
 `/accuratepingequalizer` works as a long alias. Changing your ping is announced in chat (`[Ping Equalizer] ...`),
 same as the original, so nobody is equalizing in secret. The commands are blocked while chat is set to "commands only".
+
+## Feels like the real ping, not just measures like it
+
+A ping number only says how long packets take. Two more things change how a ping *feels*, and the mod
+handles both automatically while `/ape` is on:
+
+### Input delay
+
+On a far-away server your actions only take effect once they've travelled there. Accurate Ping Equalizer
+holds back your **mouse clicks, scroll wheel and key presses** before the game reacts at all, then replays
+them in exactly the order you made them. Everything you do is affected the same way: hits (and the
+knockback you deal), crystal and anchor placing, charging and detonating, block place/break, hotbar and
+offhand swaps, inventory/GUI clicks and movement keys.
+
+- The amount is half the ping being added (≈27 ms at `/ape total 60` on a 6 ms server).
+- It happens *before* the game acts, so the server still measures exactly your target ping.
+- Your crosshair, chat typing and menus are never delayed.
+
+### Latency-hiding mods are paused
+
+Some popular client mods remove the wait for the server on purpose: crystals vanish the instant you hit
+them and anchors explode the instant you click. That makes crystal speed and anchor explosions look the
+same at any ping. While `/ape` is on, they are paused (the same as a server opting out of them), and
+restored when you turn it off:
+
+| Mod | What is paused |
+|---|---|
+| Marlow's Crystal Optimizer | instant crystal removal (via its own "server opted out" switch) |
+| ClientSideCrystals | instant / seamless crystal prediction (its saved settings are not changed) |
+| HerosAnchorOptimizer | instant ghost-anchor swap, so the anchor stays until the explosion arrives |
+
+So at `/ape total 70`, a broken crystal stays until the server confirms it 70 ms later, and an anchor takes
+1 ms longer to explode for every 1 ms of ping, like a real 70 ms connection.
 
 ## Key differences from Ravenclaw's Ping Equalizer
 
@@ -51,6 +84,8 @@ same as the original, so nobody is equalizing in secret. The commands are blocke
 | Both directions independent | One shared schedule | Outgoing (your hits, clicks, inventory) and incoming (knockback, damage, inventory, crystals) are paced separately, so a packet in one direction is never held back waiting on the other |
 | Busy PC / background timers | Windows can coarsen timers to 15.6 ms; packets then slip by a timer tick | Measures how late every wake-up really was and widens its precise wait to match, so a slow timer can't add delay |
 | Inventory & totems | Not handled specially | Inventory clicks, slot updates, equipment and totem pops get the same precise timing, so item/totem ghosting scales with the ping like it does on a real high-ping server |
+| Your own inputs | Act instantly; only packets are delayed | Clicks and keys are delayed too (input delay), so what you do feels like the ping, not just what the server sees |
+| Crystal / anchor optimizer mods | Keep hiding the ping | Paused while equalizing, so crystal speed and anchor explosions match the ping |
 | "Commands only" chat check | Uses reflection on a private field; never actually triggers | Works |
 | Installed together | n/a | Can be installed **alongside** the original: it uses `/ape` (the original keeps `/pe`), shares the server channels instead of crashing, and turning one on turns the other off so delays never stack |
 
@@ -91,7 +126,10 @@ Requires JDK 21.
 Every version is checked with a real Fabric client (production launch, not a dev environment) on a test
 server that records, as the **server** sees it, the player's round-trip time (what the tab list and most
 anticheats use) and the exact arrival time of every combat packet. Scripted runs cover a range of target
-pings, crystal/anchor-style combos (one action per tick) and connections with simulated internet jitter.
+pings, crystal/anchor-style combos (one action per tick), knockback/damage/inventory updates from the server,
+real key presses for input delay, and connections with simulated internet jitter. It is also run with a full
+crystal-PvP mod list (Sodium, Krypton, Marlow's Crystal Optimizer, ClientSideCrystals, HerosAnchorOptimizer,
+Essential and others) to make sure none of them interfere.
 
 ## Credits
 

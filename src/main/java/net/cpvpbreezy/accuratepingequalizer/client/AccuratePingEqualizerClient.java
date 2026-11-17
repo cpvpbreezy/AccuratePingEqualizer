@@ -6,6 +6,7 @@ import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.tree.LiteralCommandNode;
 
 import net.cpvpbreezy.accuratepingequalizer.EqualizerState;
+import net.cpvpbreezy.accuratepingequalizer.OptimizerPause;
 import net.cpvpbreezy.accuratepingequalizer.OriginalModInterop;
 import net.cpvpbreezy.accuratepingequalizer.net.PingEqualizerControlPayload;
 import net.cpvpbreezy.accuratepingequalizer.net.PingEqualizerStateQueryPayload;
@@ -47,6 +48,7 @@ public class AccuratePingEqualizerClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             coordinateWithOriginal();
             EqualizerState.get().tick(client);
+            OptimizerPause.tick(EqualizerState.get().isActive());
         });
 
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
