@@ -1,6 +1,7 @@
 package net.cpvpbreezy.accuratepingequalizer.client;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.tree.LiteralCommandNode;
 
@@ -17,7 +18,10 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import java.util.Locale;
+
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.PlayerListEntry;
 import net.minecraft.network.message.ChatVisibility;
 import net.minecraft.text.Text;
 
@@ -134,13 +138,23 @@ public class AccuratePingEqualizerClient implements ClientModInitializer {
                                     }))
                             .then(ClientCommandManager.literal("off")
                                     .executes(ctx -> runOff()))
-                            .then(ClientCommandManager.literal("jitter")
-                                    .then(ClientCommandManager.argument("ms", IntegerArgumentType.integer(0, EqualizerState.MAX_JITTER_MS))
-                                            .executes(ctx -> runJitter(IntegerArgumentType.getInteger(ctx, "ms")))))
-                            .then(ClientCommandManager.literal("capture")
-                                    .executes(ctx -> runCapture()))
                             .then(ClientCommandManager.literal("match")
-                                    .executes(ctx -> runMatch())));
+                                    .then(ClientCommandManager.argument("player", StringArgumentType.word())
+                                            .suggests((ctx, builder) -> {
+                                                MinecraftClient mc = MinecraftClient.getInstance();
+                                                if (mc.getNetworkHandler() != null) {
+                                                    String self = mc.player == null ? "" : mc.player.getGameProfile().name();
+                                                    String typed = builder.getRemaining().toLowerCase(Locale.ROOT);
+                                                    for (PlayerListEntry e : mc.getNetworkHandler().getPlayerList()) {
+                                                        String n = e.getProfile().name();
+                                                        if (!n.equalsIgnoreCase(self) && n.toLowerCase(Locale.ROOT).startsWith(typed)) {
+                                                            builder.suggest(n);
+                                                        }
+                                                    }
+                                                }
+                                                return builder.buildFuture();
+                                            })
+                                            .executes(ctx -> runMatch(StringArgumentType.getString(ctx, "player"))))));
             // /pe and /pingequalizer are left to Ravenclaw's Ping Equalizer so both mods can be installed.
             dispatcher.register(ClientCommandManager.literal("ape").redirect(root));
         });
@@ -198,54 +212,37 @@ public class AccuratePingEqualizerClient implements ClientModInitializer {
         return 1;
     }
 
-    private int runJitter(int ms) {
+    private int runMatch(String name) {
         if (!canChange()) {
             return 0;
         }
-        EqualizerState.get().setJitter(ms);
-        if (ms == 0) {
-            announce("Wobble off (perfectly steady ping).");
-        } else {
-            announce("Wobble set to ±" + ms + "ms.");
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.getNetworkHandler() == null) {
+            return 0;
         }
-        return 1;
-    }
-
-    private int runCapture() {
-        EqualizerState state = EqualizerState.get();
-        if (state.isCapturing()) {
-            sendLocal("Already measuring this server, hold on...");
-            return 1;
+        if (mc.player != null && mc.player.getGameProfile().name().equalsIgnoreCase(name)) {
+            sendLocal("\u00A7cYou can't match your own ping.");
+            return 0;
         }
-        sendLocal("Measuring this server's real ping and wobble for 10 seconds...");
-        state.startCapture(() -> MinecraftClient.getInstance().execute(() -> {
-            double ping = state.getProfilePing();
-            if (ping < 0) {
-                sendLocal("§cCould not measure this server (no replies). Try again.");
-                return;
+        PlayerListEntry target = null;
+        for (PlayerListEntry e : mc.getNetworkHandler().getPlayerList()) {
+            if (e.getProfile().name().equalsIgnoreCase(name)) {
+                target = e;
+                break;
             }
-            sendLocal(String.format("§aCaptured: %.0fms ping, ±%.1fms wobble. Use /ape match on another server to play exactly like this.",
-                    ping, state.getProfileJitter()));
-        }));
-        return 1;
-    }
-
-    private int runMatch() {
-        if (!canChange()) {
+        }
+        if (target == null) {
+            sendLocal("\u00A7cNo player named " + name + " is on this server.");
             return 0;
         }
-        EqualizerState state = EqualizerState.get();
-        double ping = state.getProfilePing();
-        if (ping < 0) {
-            sendLocal("§cNo captured profile yet. Join the server you want to copy and run /ape capture first.");
+        int theirs = target.getLatency();
+        if (theirs <= 0) {
+            sendLocal("\u00A7cThe server hasn't reported " + target.getProfile().name() + "'s ping yet. Try again in a few seconds.");
             return 0;
         }
-        int target = (int) Math.round(ping);
-        int jitter = (int) Math.round(state.getProfileJitter());
         stopOriginalIfRunning();
-        state.setJitter(jitter);
-        state.setTotalPing(target);
-        announce("Matching captured connection: " + target + "ms total, ±" + jitter + "ms wobble.");
+        EqualizerState.get().setMatchPlayer(target.getProfile().id(), target.getProfile().name(), theirs);
+        announce("Matching " + target.getProfile().name() + "'s ping (" + theirs + "ms).");
         return 1;
     }
 

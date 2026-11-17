@@ -13,6 +13,8 @@ import net.cpvpbreezy.accuratepingequalizer.EqualizerState;
 import net.minecraft.network.packet.Packet;
 import net.minecraft.network.packet.c2s.query.QueryPingC2SPacket;
 import net.minecraft.network.packet.s2c.query.PingResultS2CPacket;
+import net.minecraft.network.packet.c2s.play.ClickSlotC2SPacket;
+import net.minecraft.network.packet.c2s.play.CloseHandledScreenC2SPacket;
 import net.minecraft.network.packet.c2s.play.HandSwingC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerInteractBlockC2SPacket;
@@ -29,6 +31,11 @@ import net.minecraft.network.packet.s2c.play.EntityStatusS2CPacket;
 import net.minecraft.network.packet.s2c.play.EntityVelocityUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.ExplosionS2CPacket;
 import net.minecraft.network.packet.s2c.play.HealthUpdateS2CPacket;
+import net.minecraft.network.packet.s2c.play.EntityEquipmentUpdateS2CPacket;
+import net.minecraft.network.packet.s2c.play.InventoryS2CPacket;
+import net.minecraft.network.packet.s2c.play.ScreenHandlerSlotUpdateS2CPacket;
+import net.minecraft.network.packet.s2c.play.SetPlayerInventoryS2CPacket;
+import net.minecraft.network.packet.s2c.play.UpdateSelectedSlotS2CPacket;
 import net.minecraft.network.packet.s2c.play.PlayerActionResponseS2CPacket;
 
 /**
@@ -61,6 +68,19 @@ public final class EqualizerChannelHandler extends ChannelDuplexHandler {
     private static final double MEDIAN_STEP_NS = 15_000;
 
     private static volatile long spinWindowNs = -1;
+
+    /** Ceiling for the adaptive busy-wait: one coarse Windows timer tick (15.6 ms) plus margin. */
+    private static final long MAX_ADAPTIVE_SPIN_NS = TimeUnit.MICROSECONDS.toNanos(17_000);
+    private static final long SPIN_MARGIN_NS = TimeUnit.MICROSECONDS.toNanos(250);
+    /** Busy-waits longer than this yield the core between checks instead of hard spinning. */
+    private static final long YIELD_ABOVE_NS = TimeUnit.MICROSECONDS.toNanos(300);
+
+    /**
+     * Running estimate of how late a timed sleep really wakes up right now. It jumps up instantly when a
+     * wake-up is late and only decays slowly, so if Windows coarsens the timer (background windows on
+     * Windows 11, or another program changing the timer) the busy-wait widens before the next packet.
+     */
+    private double wakeOvershootNs = -1;
 
     private final ConcurrentLinkedQueue<Task> outbound = new ConcurrentLinkedQueue<>();
     private final ConcurrentLinkedQueue<Task> inbound = new ConcurrentLinkedQueue<>();
@@ -194,17 +214,20 @@ public final class EqualizerChannelHandler extends ChannelDuplexHandler {
 
     // ------------------------------------------------------------------ combat packets
 
-    /** Hits, crystal/anchor placing and breaking, anchor charging/detonating, item use, swings and hotbar swaps. */
+    /** Hits, crystal/anchor placing and breaking, anchor charging/detonating, item use, swings, hotbar swaps and inventory clicks. */
     private static boolean isCombatOutbound(Packet<?> p) {
         return p instanceof PlayerInteractEntityC2SPacket
                 || p instanceof PlayerInteractBlockC2SPacket
                 || p instanceof PlayerInteractItemC2SPacket
                 || p instanceof PlayerActionC2SPacket
                 || p instanceof HandSwingC2SPacket
-                || p instanceof UpdateSelectedSlotC2SPacket;
+                || p instanceof UpdateSelectedSlotC2SPacket
+                // inventory: totem / item swaps (ghosting depends on these crossing in flight)
+                || p instanceof ClickSlotC2SPacket
+                || p instanceof CloseHandledScreenC2SPacket;
     }
 
-    /** What the server sends back in a fight: damage, explosions, crystals appearing/vanishing, anchor block states, knockback. */
+    /** What the server sends back in a fight: damage, explosions, crystals appearing/vanishing, anchor block states, knockback, inventory/totem state. */
     private static boolean isCombatInbound(Packet<?> p) {
         return isCombatFeedback(p)
                 || p instanceof EntitySpawnS2CPacket
@@ -213,7 +236,13 @@ public final class EqualizerChannelHandler extends ChannelDuplexHandler {
                 || p instanceof ChunkDeltaUpdateS2CPacket
                 || p instanceof PlayerActionResponseS2CPacket
                 || p instanceof EntityStatusS2CPacket
-                || p instanceof EntityVelocityUpdateS2CPacket;
+                || p instanceof EntityVelocityUpdateS2CPacket
+                || p instanceof EntityEquipmentUpdateS2CPacket
+                // inventory state coming back from the server
+                || p instanceof ScreenHandlerSlotUpdateS2CPacket
+                || p instanceof InventoryS2CPacket
+                || p instanceof SetPlayerInventoryS2CPacket
+                || p instanceof UpdateSelectedSlotS2CPacket;
     }
 
     /** Inbound packets that by themselves mean you are in a fight. */
@@ -292,6 +321,20 @@ public final class EqualizerChannelHandler extends ChannelDuplexHandler {
         if (wrote && ctx.channel().isOpen()) {
             ctx.flush();
         }
+        wakePacerIfPending(outbound);
+    }
+
+    /**
+     * The pacer may be asleep until the OTHER direction's next packet; if this queue still holds
+     * packets, it must re-plan now or they would wait for that unrelated wake-up.
+     */
+    private void wakePacerIfPending(ConcurrentLinkedQueue<Task> queue) {
+        if (!queue.isEmpty()) {
+            Thread t = pacer;
+            if (t != null) {
+                LockSupport.unpark(t);
+            }
+        }
     }
 
     private void dispatchInbound() {
@@ -316,6 +359,7 @@ public final class EqualizerChannelHandler extends ChannelDuplexHandler {
                 ctx.fireChannelRead(task.msg);
             }
         }
+        wakePacerIfPending(inbound);
     }
 
     private double updateCompensation(double current, long errorNs) {
@@ -361,16 +405,18 @@ public final class EqualizerChannelHandler extends ChannelDuplexHandler {
     }
 
     private void pacerLoop() {
-        long spin = calibrateSpinWindow();
+        wakeOvershootNs = calibrateSpinWindow() - SPIN_MARGIN_NS;
         Thread self = Thread.currentThread();
         while (pacer == self) {
             long now = System.nanoTime();
             long next = Long.MAX_VALUE;
             boolean nextIsCombat = false;
+            boolean anyDue = false;
             Task o = outbound.peek();
             if (o != null) {
                 if (o.dueNs <= now + DISPATCH_SLACK_NS) {
                     requestDispatch(true);
+                    anyDue = true;
                 } else {
                     next = o.dueNs;
                     nextIsCombat = o.combat;
@@ -380,10 +426,17 @@ public final class EqualizerChannelHandler extends ChannelDuplexHandler {
             if (i != null) {
                 if (i.dueNs <= now + DISPATCH_SLACK_NS) {
                     requestDispatch(false);
+                    anyDue = true;
                 } else if (i.dueNs < next) {
                     next = i.dueNs;
                     nextIsCombat = i.combat;
                 }
+            }
+            if (anyDue) {
+                // A head is being released right now; the packets behind it may be due within
+                // microseconds, so re-plan immediately instead of sleeping on the other queue.
+                Thread.onSpinWait();
+                continue;
             }
             if (next == Long.MAX_VALUE) {
                 if (o == null && i == null) {
@@ -395,13 +448,42 @@ public final class EqualizerChannelHandler extends ChannelDuplexHandler {
                 continue;
             }
             long wait = next - now;
-            long window = nextIsCombat ? Math.max(spin, COMBAT_SPIN_NS) : spin;
+            long window = adaptiveSpinNs();
+            if (nextIsCombat) {
+                window = Math.max(window, COMBAT_SPIN_NS);
+            }
             if (wait > window) {
-                LockSupport.parkNanos(this, wait - window);
+                long sleep = wait - window;
+                long before = System.nanoTime();
+                LockSupport.parkNanos(this, sleep);
+                long over = System.nanoTime() - before - sleep;
+                if (over > 0) {
+                    // (A negative value means a new packet woke us early: says nothing about the timer.)
+                    recordWakeOvershoot(over);
+                }
+            } else if (wait > YIELD_ABOVE_NS) {
+                Thread.yield();
             } else {
                 Thread.onSpinWait();
             }
         }
+    }
+
+    private void recordWakeOvershoot(long overNs) {
+        if (overNs > wakeOvershootNs) {
+            wakeOvershootNs = overNs;
+        } else {
+            wakeOvershootNs += (overNs - wakeOvershootNs) * 0.002;
+        }
+    }
+
+    private long adaptiveSpinNs() {
+        long w = (long) wakeOvershootNs + SPIN_MARGIN_NS;
+        return Math.max(MIN_SPIN_NS, Math.min(MAX_ADAPTIVE_SPIN_NS, w));
+    }
+
+    public double getSpinWindowMs() {
+        return adaptiveSpinNs() / 1_000_000.0;
     }
 
     /** Measures how late parkNanos really wakes up on this machine and spins for that long instead. */

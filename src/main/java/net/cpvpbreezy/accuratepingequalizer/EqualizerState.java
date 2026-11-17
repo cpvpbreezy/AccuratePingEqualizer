@@ -1,15 +1,9 @@
 package net.cpvpbreezy.accuratepingequalizer;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
-import java.util.Properties;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -18,7 +12,6 @@ import net.cpvpbreezy.accuratepingequalizer.net.EqualizerChannelHandler;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.PlayerListEntry;
-import net.fabricmc.loader.api.FabricLoader;
 
 /**
  * Holds the equalizer mode and works out how much delay to add.
@@ -62,43 +55,10 @@ public final class EqualizerState {
 
     private volatile long combatUntilNs = 0;
 
-    // ---- realism: copy the wobble of a real connection
-    /** Correlation time of the emulated wobble; real internet jitter drifts rather than flickering per packet. */
-    private static final double JITTER_TAU_NS = TimeUnit.MILLISECONDS.toNanos(150);
-    public static final int MAX_JITTER_MS = 50;
-    private static final long CAPTURE_DURATION_NS = TimeUnit.SECONDS.toNanos(10);
-    private static final long CAPTURE_INTERVAL_NS = TimeUnit.MILLISECONDS.toNanos(100);
-
-    /** Requested round-trip wobble (standard deviation, ms). 0 = perfectly flat. */
-    private volatile double jitterSdMs = 0;
-    private final Wobble outboundWobble = new Wobble();
-    private final Wobble inboundWobble = new Wobble();
-
-    private volatile boolean capturing = false;
-    private long captureEndsNs = 0;
-    private final List<Double> captureSamples = new ArrayList<>();
-    private double profilePingMs = -1;
-    private double profileJitterMs = 0;
-    private Runnable captureDone;
-
-    /** Smoothly drifting random offset (Ornstein-Uhlenbeck), one per direction. */
-    private static final class Wobble {
-        private double x;
-        private long lastNs;
-
-        synchronized double sampleMs(long now, double sdMs) {
-            if (sdMs <= 0) {
-                x = 0;
-                lastNs = now;
-                return 0;
-            }
-            double dt = lastNs == 0 ? JITTER_TAU_NS * 10 : (now - lastNs);
-            lastNs = now;
-            double a = Math.exp(-dt / JITTER_TAU_NS);
-            x = x * a + sdMs * Math.sqrt(1 - a * a) * ThreadLocalRandom.current().nextGaussian();
-            return x;
-        }
-    }
+    /** /ape match <player>: follow that player's tab-list ping as the total target. */
+    private volatile UUID followUuid;
+    private volatile String followName;
+    private boolean followLost = false;
 
     private volatile Mode mode = Mode.OFF;
     private volatile boolean serverEnabled = true;
@@ -133,6 +93,8 @@ public final class EqualizerState {
     // ------------------------------------------------------------------ commands
 
     public synchronized void setOff() {
+        followUuid = null;
+        followName = null;
         mode = Mode.OFF;
         appliedDelayMs = 0;
         jumpPending = false;
@@ -144,6 +106,8 @@ public final class EqualizerState {
             setOff();
             return;
         }
+        followUuid = null;
+        followName = null;
         mode = Mode.ADD;
         addAmount = clamp(amount);
         appliedDelayMs = addAmount;
@@ -152,6 +116,22 @@ public final class EqualizerState {
     }
 
     public synchronized void setTotalPing(int target) {
+        followUuid = null;
+        followName = null;
+        applyTotal(target);
+    }
+
+    /** Matches another player's ping (from the tab list) and keeps following it as it changes. */
+    public synchronized void setMatchPlayer(UUID uuid, String name, int theirPing) {
+        applyTotal(theirPing);
+        if (mode == Mode.TOTAL) {
+            followUuid = uuid;
+            followName = name;
+            followLost = false;
+        }
+    }
+
+    private void applyTotal(int target) {
         if (!serverEnabled) {
             setOff();
             return;
@@ -186,8 +166,6 @@ public final class EqualizerState {
         serverEnabled = true;
         setOff();
         clearMeasurements();
-        capturing = false;
-        captureDone = null;
     }
 
     // ------------------------------------------------------------------ pipeline hooks
@@ -218,13 +196,7 @@ public final class EqualizerState {
         if (sent == null) {
             return;
         }
-        double rtt = (nanoTime - sent) / 1_000_000.0;
-        addSample(rtt, nanoTime);
-        if (capturing) {
-            synchronized (this) {
-                captureSamples.add(rtt);
-            }
-        }
+        addSample((nanoTime - sent) / 1_000_000.0, nanoTime);
     }
 
     /** Called from the network thread whenever a combat packet goes out or combat feedback comes in. */
@@ -240,137 +212,20 @@ public final class EqualizerState {
         return serverEnabled && mode != Mode.OFF;
     }
 
-    /** Outbound half of the added delay (plus emulated wobble, if any), in nanoseconds. */
+    /** Outbound half of the added delay, in nanoseconds. */
     public long outboundDelayNanos() {
         if (!isActive()) {
             return 0;
         }
-        double half = appliedDelayMs / 2.0;
-        return toNanos(half + wobble(outboundWobble, half));
+        return (long) (appliedDelayMs * 500_000.0);
     }
 
-    /** Inbound half of the added delay (plus emulated wobble, if any), in nanoseconds. */
+    /** Inbound half of the added delay, in nanoseconds. */
     public long inboundDelayNanos() {
         if (!isActive()) {
             return 0;
         }
-        double half = appliedDelayMs / 2.0;
-        return toNanos(half + wobble(inboundWobble, half));
-    }
-
-    private double wobble(Wobble w, double halfMs) {
-        double sd = jitterSdMs;
-        if (sd <= 0) {
-            return 0;
-        }
-        // The connection already wobbles a little by itself; only add what is missing.
-        double own = jitterMs;
-        double missing = Math.sqrt(Math.max(0, sd * sd - own * own));
-        // Split the round-trip wobble over two independent directions.
-        double perDirection = missing / Math.sqrt(2);
-        double v = w.sampleMs(System.nanoTime(), perDirection);
-        return Math.max(-halfMs, v);
-    }
-
-    private static long toNanos(double ms) {
-        return ms <= 0 ? 0 : (long) (ms * 1_000_000.0);
-    }
-
-    // ------------------------------------------------------------------ realism
-
-    public void setJitter(int sdMs) {
-        jitterSdMs = Math.max(0, Math.min(MAX_JITTER_MS, sdMs));
-    }
-
-    public double getJitterSetting() {
-        return jitterSdMs;
-    }
-
-    /** Measures this server's real ping and wobble for 10 s and stores it as the profile to copy elsewhere. */
-    public synchronized void startCapture(Runnable onDone) {
-        captureSamples.clear();
-        captureEndsNs = System.nanoTime() + CAPTURE_DURATION_NS;
-        captureDone = onDone;
-        capturing = true;
-        lastProbeNs = 0;
-    }
-
-    public boolean isCapturing() {
-        return capturing;
-    }
-
-    private void finishCapture() {
-        Runnable done;
-        synchronized (this) {
-            capturing = false;
-            done = captureDone;
-            captureDone = null;
-            if (captureSamples.size() >= 10) {
-                double[] v = captureSamples.stream().mapToDouble(Double::doubleValue).sorted().toArray();
-                int trim = v.length / 20; // drop the top/bottom 5% (one-off spikes)
-                double sum = 0;
-                int n = 0;
-                for (int i = trim; i < v.length - trim; i++) {
-                    sum += v[i];
-                    n++;
-                }
-                double mean = sum / n;
-                double var = 0;
-                for (int i = trim; i < v.length - trim; i++) {
-                    var += (v[i] - mean) * (v[i] - mean);
-                }
-                profilePingMs = mean;
-                profileJitterMs = Math.sqrt(var / n);
-                saveProfile();
-            }
-        }
-        if (done != null) {
-            done.run();
-        }
-    }
-
-    public synchronized double getProfilePing() {
-        if (profilePingMs < 0) {
-            loadProfile();
-        }
-        return profilePingMs;
-    }
-
-    public synchronized double getProfileJitter() {
-        if (profilePingMs < 0) {
-            loadProfile();
-        }
-        return profileJitterMs;
-    }
-
-    private static Path profileFile() {
-        return FabricLoader.getInstance().getConfigDir().resolve("accuratepingequalizer.properties");
-    }
-
-    private void saveProfile() {
-        Properties p = new Properties();
-        p.setProperty("profile.ping", String.format(java.util.Locale.ROOT, "%.2f", profilePingMs));
-        p.setProperty("profile.jitter", String.format(java.util.Locale.ROOT, "%.2f", profileJitterMs));
-        try (var out = Files.newBufferedWriter(profileFile())) {
-            p.store(out, "Accurate Ping Equalizer - captured connection profile (/ape capture, /ape match)");
-        } catch (IOException e) {
-            org.slf4j.LoggerFactory.getLogger("AccuratePingEqualizer").warn("Could not save profile: {}", e.toString());
-        }
-    }
-
-    private void loadProfile() {
-        Path f = profileFile();
-        if (!Files.exists(f)) {
-            return;
-        }
-        Properties p = new Properties();
-        try (var in = Files.newBufferedReader(f)) {
-            p.load(in);
-            profilePingMs = Double.parseDouble(p.getProperty("profile.ping", "-1"));
-            profileJitterMs = Double.parseDouble(p.getProperty("profile.jitter", "0"));
-        } catch (IOException | NumberFormatException e) {
-            profilePingMs = -1;
-        }
+        return (long) (appliedDelayMs * 1_000_000.0) - outboundDelayNanos();
     }
 
     // ------------------------------------------------------------------ per tick
@@ -378,24 +233,12 @@ public final class EqualizerState {
     public void tick(MinecraftClient client) {
         long now = System.nanoTime();
         expireProbes(now);
-        if (capturing) {
-            if (now - captureEndsNs >= 0) {
-                finishCapture();
-            } else {
-                EqualizerChannelHandler h = handler;
-                if (h != null && now - lastProbeNs >= CAPTURE_INTERVAL_NS) {
-                    lastProbeNs = now;
-                    h.sendProbe(PROBE_TAG | (probeSeq.incrementAndGet() & ~PROBE_TAG_MASK));
-                }
-            }
-        }
         if (!isActive()) {
             lastControlNs = now;
             return;
         }
-        if (!capturing) {
-            sendProbeIfDue(now);
-        }
+        sendProbeIfDue(now);
+        followMatchedPlayer(client);
         synchronized (this) {
             double dtSeconds = lastControlNs == 0 ? 0.05 : Math.min(0.25, (now - lastControlNs) / 1e9);
             lastControlNs = now;
@@ -427,6 +270,29 @@ public final class EqualizerState {
             // Follow drift in the real ping smoothly so packets are never bunched up or stalled.
             double step = Math.min(Math.abs(diff), SLEW_MS_PER_SECOND * dtSeconds);
             appliedDelayMs += Math.copySign(step, diff);
+        }
+    }
+
+    /** Keeps the target on the matched player's current tab-list ping. */
+    private void followMatchedPlayer(MinecraftClient client) {
+        UUID uuid = followUuid;
+        if (uuid == null || client == null) {
+            return;
+        }
+        ClientPlayNetworkHandler nh = client.getNetworkHandler();
+        PlayerListEntry entry = nh == null ? null : nh.getPlayerListEntry(uuid);
+        synchronized (this) {
+            if (entry == null) {
+                // They left: keep their last ping.
+                followLost = true;
+                return;
+            }
+            followLost = false;
+            int theirs = entry.getLatency();
+            if (theirs > 0 && theirs != totalTarget) {
+                // The tick's slew (and combat lock) moves the delay there smoothly.
+                totalTarget = theirs;
+            }
         }
     }
 
@@ -600,6 +466,10 @@ public final class EqualizerState {
         return getBasePing() + getCurrentDelayMs();
     }
 
+    public String getFollowName() {
+        return followName;
+    }
+
     public synchronized int getTotalTarget() {
         return totalTarget;
     }
@@ -615,7 +485,14 @@ public final class EqualizerState {
         if (mode == Mode.OFF) {
             return "Accurate Ping Equalizer: OFF";
         }
-        String modeStr = mode == Mode.ADD ? "ADD +" + addAmount + "ms" : "TOTAL " + totalTarget + "ms";
+        String modeStr;
+        if (mode == Mode.ADD) {
+            modeStr = "ADD +" + addAmount + "ms";
+        } else if (followName != null) {
+            modeStr = "MATCH " + followName + " " + totalTarget + "ms" + (followLost ? " (left, holding)" : "");
+        } else {
+            modeStr = "TOTAL " + totalTarget + "ms";
+        }
         if (baseMs < 0) {
             return String.format("Accurate Ping Equalizer: %s | Added: %dms | Measuring base ping...",
                     modeStr, getCurrentDelayMs());
@@ -626,9 +503,6 @@ public final class EqualizerState {
             pacing = String.format(" | Timing error: %.1fms", h.getRecentTimingErrorMs());
         }
         String combat = isInCombat(System.nanoTime()) ? " | Combat lock" : "";
-        if (jitterSdMs > 0) {
-            combat += String.format(" | Wobble \u00B1%.0fms", jitterSdMs);
-        }
         return String.format("Accurate Ping Equalizer: %s | Base: %.0fms (±%.0f) | Added: %.0fms | Total: %.0fms%s%s",
                 modeStr, baseMs, jitterMs, appliedDelayMs, baseMs + appliedDelayMs, pacing, combat);
     }

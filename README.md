@@ -28,9 +28,7 @@ low pings people actually play at, and in fast combos (crystals, anchors, sword 
 |---|---|
 | `/ape total <ms>` | Make your **total** ping exactly `<ms>` (it measures your real ping and adds the difference). |
 | `/ape add <ms>` | Add a fixed `<ms>` on top of your real ping. |
-| `/ape capture` | On a server you want to copy: measures your real ping **and how much it wobbles** for 10 s and saves it. |
-| `/ape match` | On another server: play with exactly the captured ping and wobble. |
-| `/ape jitter <ms>` | Set the wobble by hand (`0` = perfectly steady, the default). |
+| `/ape match <player>` | Make your total ping the same as another player's (from the tab list), and keep following it if theirs changes. |
 | `/ape status` | Real (base) ping, added delay, total, live timing error, combat lock. |
 | `/ape off` | Turn it off. |
 
@@ -50,7 +48,9 @@ same as the original, so nobody is equalizing in secret. The commands are blocke
 | Delay resolution | Rounded to 2 ms steps, re-adjusted up to every 150 ms (even mid-fight) | Sub-millisecond, and **frozen during combat** (see below) |
 | Combat | Not handled specially | **Combat lock:** after a hit, crystal place/break, anchor place/charge/detonate, block place/break, hotbar swap or taking damage, the delay is frozen for 3 s, so every action in a combo reaches the server with the same delay and the **exact spacing you made it with**. Combat packets also get extra-precise timing |
 | Max added delay | 400 ms | 1000 ms |
-| Feel of a real connection | Always a perfectly flat line | Optional wobble that copies a real server (`/ape capture` → `/ape match`), keeping TCP-style packet order and bunching |
+| Both directions independent | One shared schedule | Outgoing (your hits, clicks, inventory) and incoming (knockback, damage, inventory, crystals) are paced separately, so a packet in one direction is never held back waiting on the other |
+| Busy PC / background timers | Windows can coarsen timers to 15.6 ms; packets then slip by a timer tick | Measures how late every wake-up really was and widens its precise wait to match, so a slow timer can't add delay |
+| Inventory & totems | Not handled specially | Inventory clicks, slot updates, equipment and totem pops get the same precise timing, so item/totem ghosting scales with the ping like it does on a real high-ping server |
 | "Commands only" chat check | Uses reflection on a private field; never actually triggers | Works |
 | Installed together | n/a | Can be installed **alongside** the original: it uses `/ape` (the original keeps `/pe`), shares the server channels instead of crashing, and turning one on turns the other off so delays never stack |
 
@@ -60,7 +60,10 @@ At high targets, a few ms of error is a small fraction of the total. At 40–80 
 
 1. The base-ping estimate in the original drifted (it was measured through its own delay), and at low targets that error is a big share of the total.
 2. Timer overshoot on Windows added a few unaccounted milliseconds to every packet.
-3. A real 65 ms connection is not a flat 65 ms. It wobbles by a few ms, and that wobble is a big part of how a low ping "feels". `/ape capture` + `/ape match` reproduces it.
+3. Packets could be held back by up to a server tick when the two directions' timers interfered. At 65 ms that random extra delay is very noticeable; at 300 ms much less so.
+
+Measured on a test server: at `/ape total 65` your actions, knockback, damage, health and inventory updates
+all land within about ±0.3 ms of exactly 32.5 ms each way (90 % within ~2 ms).
 
 ## Works with servers
 
