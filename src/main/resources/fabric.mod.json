@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "accuratepingequalizer",
+  "version": "${version}",
+  "name": "Accurate Ping Equalizer",
+  "description": "Adds latency so you play at an exact target ping. Measures your real network ping, paces packets with a calibrated high-precision timer and corrects its own timing error. Fork of Ravenclaw's Ping Equalizer.",
+  "authors": [
+    "cpvpbreezy"
+  ],
+  "contributors": [
+    "Ravenclaw (original Ping Equalizer)"
+  ],
+  "contact": {
+    "sources": "https://github.com/cpvpbreezy/AccuratePingEqualizer",
+    "issues": "https://github.com/cpvpbreezy/AccuratePingEqualizer/issues"
+  },
+  "license": "MIT",
+  "icon": "assets/accuratepingequalizer/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "net.cpvpbreezy.accuratepingequalizer.client.AccuratePingEqualizerClient"
+    ]
+  },
+  "mixins": [
+    "accuratepingequalizer.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "fabric-api": "*",
+    "minecraft": "~1.21.11"
+  }
+}
